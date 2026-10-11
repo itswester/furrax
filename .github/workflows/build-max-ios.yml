@@ -1,1 +1,110 @@
+name: Build MAX iOS
 
+on:
+  workflow_dispatch:
+
+env:
+  FLUTTER_VERSION: '3.44.3'
+  KOMET_REF: '1ae07312b2d0c6d667a3760ac41f20f3d9891463'
+
+jobs:
+  build:
+    runs-on: macos-latest
+    permissions:
+      contents: read
+    steps:
+      - name: Checkout Komet (pinned)
+        uses: actions/checkout@v4
+        with:
+          repository: KometTeam/Komet
+          ref: ${{ env.KOMET_REF }}
+          submodules: recursive
+
+      - name: Checkout this repo (with komet-max-ui zip)
+        uses: actions/checkout@v4
+        with:
+          path: overlay
+
+      - name: Apply MAX changes from zip
+        run: |
+          set -euo pipefail
+          ls -la overlay
+          found=0
+          for z in overlay/komet-max-ui*.zip; do
+            [ -f "$z" ] || continue
+            unzip -oq "$z" -d /tmp/maxui
+            found=1
+          done
+          [ "$found" = 1 ] || { echo "ZIP komet-max-ui*.zip not found in repo root"; exit 1; }
+          cp -R /tmp/maxui/komet-max-ui/lib /tmp/maxui/komet-max-ui/ios /tmp/maxui/komet-max-ui/assets .
+          grep -q "MAX" ios/Runner/Info.plist
+          grep -q "_buildFlatNavBar" lib/frontend/screens/chats/chat_list_screen.dart
+          echo "MAX overlay applied"
+
+      - name: Setup Flutter
+        uses: subosito/flutter-action@v2
+        with:
+          flutter-version: ${{ env.FLUTTER_VERSION }}
+          channel: 'stable'
+
+      - name: Setup Rust
+        uses: ./.github/actions/setup-rust
+        with:
+          targets: aarch64-apple-ios,aarch64-apple-ios-sim,x86_64-apple-ios
+
+      - name: Get dependencies
+        run: flutter pub get
+
+      - name: Build iOS (no codesign)
+        run: |
+          flutter config --no-enable-swift-package-manager
+          flutter build ios --release --no-codesign
+
+      - name: Install ldid
+        run: brew install ldid
+
+      - name: Pseudo-sign with ldid
+        run: |
+          set -euo pipefail
+          APP="build/ios/iphoneos/Runner.app"
+          ENT="$(mktemp -t ent).plist"
+          cat > "$ENT" <<'PLIST'
+          <?xml version="1.0" encoding="UTF-8"?>
+          <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+          <plist version="1.0">
+          <dict>
+            <key>get-task-allow</key><true/>
+            <key>application-identifier</key><string>ru.komet.app</string>
+            <key>keychain-access-groups</key>
+            <array><string>ru.komet.app</string></array>
+          </dict>
+          </plist>
+          PLIST
+          if [ -d "$APP/Frameworks" ]; then
+            find "$APP/Frameworks" -type f -name "*.dylib" -print0 | xargs -0 -I{} ldid -S "{}"
+            find "$APP/Frameworks" -type d -name "*.framework" | while read -r fw; do
+              bin="$fw/$(basename "$fw" .framework)"
+              [ -f "$bin" ] && ldid -S "$bin"
+            done
+          fi
+          if [ -d "$APP/PlugIns" ]; then
+            find "$APP/PlugIns" -type d -name "*.appex" | while read -r ext; do
+              bin="$ext/$(basename "$ext" .appex)"
+              [ -f "$bin" ] && ldid -S"$ENT" "$bin"
+            done
+          fi
+          ldid -S"$ENT" "$APP/Runner"
+
+      - name: Package IPA
+        run: |
+          mkdir -p dist build/ios/Payload
+          cp -R build/ios/iphoneos/Runner.app build/ios/Payload/
+          (cd build/ios && zip -qr ../../dist/MAX-ios.ipa Payload)
+
+      - name: Upload IPA
+        uses: actions/upload-artifact@v4
+        with:
+          name: MAX-ios
+          path: dist/MAX-ios.ipa
+          if-no-files-found: error
+          retention-days: 30
